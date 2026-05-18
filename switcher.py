@@ -7,13 +7,23 @@ import os
 import json
 import tkinter as tk
 from tkinter import messagebox
-import threading
 import winreg
 import sys
+import queue
 
-# --- КОНСТАНТИ ---
+# --- КОНСТАНТИ ТА НАЛАШТУВАННЯ ---
 CONFIG_FILE = "config.json"
 APP_NAME = "F8Flip"
+
+# СПИСОК ВИНЯТКІВ: Додай сюди назви .exe файлів, де програма має "спати"
+IGNORE_APPS = {
+    "blender.exe",
+    "3dsmax.exe",
+    "photoshop.exe",
+    "zbrush.exe",
+    "maya.exe",
+    "acs.exe"  # Assetto Corsa
+}
 
 ENG_SET = set("qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM[]{}'\"`~<>;:")
 CYR_SET = set("йцукенгшщзхїфівапролджєячсмитьбюЙЦУКЕНГШЩЗХЇФІВАПРОЛДЖЄЯЧСМИТЬБЮъыэёЪЫЭЁ")
@@ -28,13 +38,12 @@ cyrillic_to_eng = str.maketrans(UKR_CHARS + RU_CHARS, ENG_CHARS + ENG_CHARS)
 
 MAX_BUFFER_LENGTH = 500
 
-# Розширений список клавіш, які скидають буфер
 RESET_KEYS = {
     'enter', 'tab', 'esc', 'up', 'down', 'left', 'right',
-    'page up', 'page down', 'home', 'end',
-    'alt', 'left alt', 'right alt', 'windows', 'left windows'
+    'page up', 'page down', 'home', 'end', 'delete'
 }
-MODIFIERS = {'ctrl', 'left ctrl', 'right ctrl', 'alt', 'left alt', 'right alt', 'shift', 'left shift', 'right shift'}
+MODIFIERS_ALL = {'ctrl', 'left ctrl', 'right ctrl', 'alt', 'left alt', 'right alt', 'windows', 'left windows',
+                 'right windows'}
 
 WM_INPUTLANGCHANGEREQUEST = 0x0050
 LANG_EN = 0x0409
@@ -42,6 +51,8 @@ LANG_UKR = 0x0422
 LANG_RU = 0x0419
 
 user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
 user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 user32.PostMessageW.restype = wintypes.BOOL
 
@@ -81,10 +92,48 @@ def set_startup(enable):
 
 
 # --- WINDOWS API ХЕЛПЕРИ ---
+def get_active_process_name(hwnd):
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    h_process = kernel32.OpenProcess(0x1000, False, pid)
+    if h_process:
+        buffer = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        if kernel32.QueryFullProcessImageNameW(h_process, 0, buffer, ctypes.byref(size)):
+            kernel32.CloseHandle(h_process)
+            return os.path.basename(buffer.value).lower()
+        kernel32.CloseHandle(h_process)
+    return ""
+
+
+def send_hardware_keyup(vk_code, extended=False):
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_ulonglong)]
+
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
+
+    flags = 0x0002
+    if extended:
+        flags |= 0x0001
+
+    inp = INPUT(type=1, u=INPUT_UNION(ki=KEYBDINPUT(wVk=vk_code, wScan=0, dwFlags=flags, time=0, dwExtraInfo=0)))
+    user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+
 def release_all_modifiers():
-    vks = [0x10, 0xA0, 0xA1, 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5]
-    for vk in vks:
-        user32.keybd_event(vk, 0, 0x0002, 0)
+    vks = [
+        (0x10, False), (0xA0, False), (0xA1, False),
+        (0x11, False), (0xA2, False), (0xA3, True),
+        (0x12, False), (0xA4, False), (0xA5, True),
+        (0x5B, True), (0x5C, True)
+    ]
+    for vk, ext in vks:
+        send_hardware_keyup(vk, ext)
 
 
 def get_current_layout():
@@ -113,6 +162,11 @@ def set_system_layout(hkl_code):
 # --- ОСНОВНИЙ КЛАС ДОДАТКУ ---
 class Flip8App:
     def __init__(self):
+        # Ініціалізація головного вікна Tkinter (приховано) для безпечної багатопотоковості
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.ui_queue = queue.Queue()
+
         self.current_buffer = ""
         self.is_switching = False
         self.cycle_sequence = []
@@ -124,16 +178,30 @@ class Flip8App:
         self.just_switched = False
         self.last_f8_time = 0
 
-        # Відслідковування активного вікна
         self.last_hwnd = user32.GetForegroundWindow()
+        self.active_app_name = get_active_process_name(self.last_hwnd)
 
         self.load_or_create_config()
 
         mouse.on_click(self.reset_buffer)
         keyboard.hook(self.process_key)
 
-        self.register_hotkey()
-        keyboard.add_hotkey('ctrl+win+f8', self.change_hotkey_runtime)
+        # Запуск перевірки черги повідомлень UI
+        self.check_ui_queue()
+
+    def run(self):
+        """Запускає головний цикл Tkinter. Програма працюватиме, поки працює цей цикл."""
+        self.root.mainloop()
+
+    def check_ui_queue(self):
+        """Регулярно перевіряє, чи не надійшла команда з іншого потоку на відкриття вікна."""
+        try:
+            msg = self.ui_queue.get_nowait()
+            if msg == "show_settings":
+                self.change_hotkey_runtime()
+        except queue.Empty:
+            pass
+        self.root.after(100, self.check_ui_queue)
 
     def reset_buffer(self):
         self.current_buffer = ""
@@ -146,18 +214,44 @@ class Flip8App:
         if current_hwnd != self.last_hwnd:
             self.reset_buffer()
             self.last_hwnd = current_hwnd
+            self.active_app_name = get_active_process_name(current_hwnd)
 
     def process_key(self, event):
-        if self.is_switching:
+        if not event.name:
             return
 
-        # 1. Перевірка зміни вікна (щоб уникнути заміни тексту в іншій програмі)
+        name_lower = event.name.lower()
+
+        # Апаратне відпускання модифікаторів
+        if event.event_type == keyboard.KEY_UP:
+            if name_lower == 'right ctrl':
+                send_hardware_keyup(0xA3, extended=True)
+            elif name_lower == 'right alt':
+                send_hardware_keyup(0xA5, extended=True)
+
+        # 1. СПОЧАТКУ перевіряємо зміну вікна на натисканні
         if event.event_type == keyboard.KEY_DOWN:
             self.check_window_changed()
 
-        # 2. Відслідковування гарячої клавіші (якщо це модифікатор)
-        if self.current_hotkey in MODIFIERS:
-            if event.name.lower() == self.current_hotkey:
+        # 2. ПОТІМ блокуємо обробку, якщо активна програма у списку винятків
+        if self.active_app_name in IGNORE_APPS:
+            return
+
+        if self.is_switching:
+            return
+
+        # Виклик меню налаштувань (Ctrl+Win+F8)
+        if name_lower == 'f8' and event.event_type == keyboard.KEY_DOWN:
+            ctrl_down = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
+            win_down = bool(user32.GetAsyncKeyState(0x5B) & 0x8000) or bool(user32.GetAsyncKeyState(0x5C) & 0x8000)
+            if ctrl_down and win_down:
+                # Надсилаємо сигнал в головний потік Tkinter
+                self.ui_queue.put("show_settings")
+                return
+
+        # Обробка поточної гарячої клавіші програми
+        if name_lower == self.current_hotkey:
+            if self.current_hotkey in MODIFIERS_ALL:
                 if event.event_type == keyboard.KEY_DOWN:
                     if self.modifier_down_time == 0:
                         self.modifier_down_time = time.time()
@@ -165,40 +259,49 @@ class Flip8App:
                 elif event.event_type == keyboard.KEY_UP:
                     if self.modifier_down_time != 0 and not self.combo_pressed:
                         if time.time() - self.modifier_down_time < 0.5:
-                            threading.Thread(target=self.switch_layout, daemon=True).start()
+                            self.switch_layout()
                     self.modifier_down_time = 0
-                return
             else:
                 if event.event_type == keyboard.KEY_DOWN:
-                    self.combo_pressed = True
-
-        # 3. Скидання буфера при спробі вставити текст з буфера обміну (Ctrl+V)
-        if event.event_type == keyboard.KEY_DOWN and event.name.lower() == 'v' and keyboard.is_pressed('ctrl'):
-            self.reset_buffer()
+                    self.switch_layout()
             return
 
         if event.event_type != keyboard.KEY_DOWN:
             return
 
-        name = event.name
+        if 'shift' not in name_lower:
+            self.combo_pressed = True
 
-        if len(name) == 1 or name == 'space' or name == 'backspace':
-            self.cycle_sequence = []
+        # Скидання буфера на комбінації типу Ctrl+C, Win+D тощо
+        if len(name_lower) == 1:
+            ctrl_down = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
+            alt_down = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+            win_down = bool(user32.GetAsyncKeyState(0x5B) & 0x8000) or bool(user32.GetAsyncKeyState(0x5C) & 0x8000)
+
+            if ctrl_down or alt_down or win_down:
+                self.reset_buffer()
+                return
+
+        if name_lower in ['shift', 'left shift', 'right shift', 'caps lock']:
+            return
+
+        if len(name_lower) == 1 or name_lower == 'space' or name_lower == 'backspace':
             if self.just_switched:
                 self.current_buffer = ""
                 self.just_switched = False
+            self.cycle_sequence = []
 
-        if len(name) == 1:
-            self.current_buffer += name
+        if len(name_lower) == 1:
+            self.current_buffer += event.name
             if len(self.current_buffer) > MAX_BUFFER_LENGTH:
                 self.current_buffer = self.current_buffer[-MAX_BUFFER_LENGTH:]
-        elif name == 'space':
+        elif name_lower == 'space':
             self.current_buffer += ' '
             if len(self.current_buffer) > MAX_BUFFER_LENGTH:
                 self.current_buffer = self.current_buffer[-MAX_BUFFER_LENGTH:]
-        elif name == 'backspace':
+        elif name_lower == 'backspace':
             self.current_buffer = self.current_buffer[:-1]
-        elif name in RESET_KEYS:
+        elif name_lower in RESET_KEYS:
             self.reset_buffer()
 
     def switch_layout(self):
@@ -249,17 +352,12 @@ class Flip8App:
             fixed_text, target_lang_id = self.cycle_sequence[self.cycle_index]
             buffer_length = len(self.current_buffer)
 
-            # ОПТИМІЗОВАНЕ ВИДАЛЕННЯ З БЕЗПЕЧНИМИ ЗАТРИМКАМИ
-            if buffer_length > 10:
-                for _ in range(buffer_length):
-                    keyboard.send('shift+left')
-                    time.sleep(0.001)  # Захист від пропуску кадрів у важких програмах
+            # Надійне видалення попереднього тексту
+            for _ in range(buffer_length):
                 keyboard.send('backspace')
-            else:
-                for _ in range(buffer_length):
-                    keyboard.send('backspace')
-                    time.sleep(0.001)
+                time.sleep(0.001)
 
+            time.sleep(0.02)
             keyboard.write(fixed_text, delay=0.002, restore_state_after=False)
 
             target_hkl = get_hkl_for_language(target_lang_id)
@@ -270,6 +368,7 @@ class Flip8App:
             self.just_switched = True
 
         finally:
+            release_all_modifiers()
             self.is_switching = False
 
     # --- ГРАФІЧНИЙ ІНТЕРФЕЙС ТА НАЛАШТУВАННЯ ---
@@ -278,15 +377,23 @@ class Flip8App:
         result_startup = is_in_startup()
         saved = False
 
-        root = tk.Tk()
-        root.title("Flip8 - Налаштування")
-        root.geometry("340x380")
-        root.resizable(False, False)
-        root.attributes("-topmost", True)
-        root.eval('tk::PlaceWindow . center')
+        # Створюємо поверхневе вікно (Toplevel) замість нового Tk()
+        top = tk.Toplevel(self.root)
+        top.title("Flip8 - Налаштування")
+        top.geometry("360x420")
+        top.resizable(False, False)
+        top.attributes("-topmost", True)
+
+        # Центрування вікна
+        top.update_idletasks()
+        width = top.winfo_width()
+        height = top.winfo_height()
+        x = (top.winfo_screenwidth() // 2) - (width // 2)
+        y = (top.winfo_screenheight() // 2) - (height // 2)
+        top.geometry('{}x{}+{}+{}'.format(width, height, x, y))
 
         chosen_key = tk.StringVar(value=initial_value)
-        tk.Label(root, text="Оберіть гарячу клавішу\nдля перемикання розкладки:", font=("Segoe UI", 11, "bold"),
+        tk.Label(top, text="Оберіть гарячу клавішу\nдля перемикання розкладки:", font=("Segoe UI", 11, "bold"),
                  pady=15).pack()
 
         options = [
@@ -297,7 +404,7 @@ class Flip8App:
             ("Правий Alt", "right alt")
         ]
 
-        frame = tk.Frame(root)
+        frame = tk.Frame(top)
         frame.pack(pady=5)
 
         for text, val in options:
@@ -305,7 +412,7 @@ class Flip8App:
             rb.pack(anchor="w", pady=2)
 
         startup_var = tk.BooleanVar(value=result_startup)
-        tk.Checkbutton(root, text="Запускати автоматично з Windows", variable=startup_var,
+        tk.Checkbutton(top, text="Запускати автоматично з Windows", variable=startup_var,
                        font=("Segoe UI", 10, "italic"), cursor="hand2").pack(pady=10)
 
         def on_save():
@@ -313,23 +420,24 @@ class Flip8App:
             result_key = chosen_key.get()
             result_startup = startup_var.get()
             saved = True
-            root.quit()
-
-        tk.Button(root, text="Зберегти", command=on_save, font=("Segoe UI", 10, "bold"), bg="#0078D7", fg="white",
-                  width=20, cursor="hand2").pack(pady=5)
-        tk.Label(root, text="(Це меню завжди можна викликати\nкомбінацією Ctrl + Win + F8)", font=("Segoe UI", 8),
-                 fg="gray").pack(side="bottom", pady=10)
+            top.destroy()
 
         def on_closing():
             nonlocal result_key, result_startup, saved
             result_key = initial_value
             result_startup = is_in_startup()
             saved = False
-            root.quit()
+            top.destroy()
 
-        root.protocol("WM_DELETE_WINDOW", on_closing)
-        root.mainloop()
-        root.destroy()
+        tk.Button(top, text="Зберегти", command=on_save, font=("Segoe UI", 10, "bold"), bg="#0078D7", fg="white",
+                  width=20, cursor="hand2").pack(pady=5)
+        tk.Label(top, text="(Це меню завжди можна викликати\nкомбінацією Ctrl + Win + F8)", font=("Segoe UI", 8),
+                 fg="gray").pack(side="bottom", pady=10)
+
+        top.protocol("WM_DELETE_WINDOW", on_closing)
+
+        # Блокуємо подальше виконання коду, поки вікно не закриється
+        self.root.wait_window(top)
         return result_key, result_startup, saved
 
     def load_or_create_config(self):
@@ -341,7 +449,7 @@ class Flip8App:
             except (json.JSONDecodeError, OSError):
                 self.current_hotkey = "f8"
         else:
-            chosen_key, run_on_startup, saved = self.ask_user_for_hotkey("f8")
+            chosen_key, run_on_startup, saved = self.ask_user_for_hotkey(initial_value="f8")
             if saved:
                 self.current_hotkey = chosen_key
                 set_startup(run_on_startup)
@@ -354,17 +462,7 @@ class Flip8App:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump({"hotkey": hotkey_value}, f, ensure_ascii=False, indent=4)
         except OSError:
-            # Якщо файл заблоковано, просто продовжуємо роботу
             pass
-
-    def register_hotkey(self):
-        try:
-            keyboard.remove_hotkey(self.switch_layout)
-        except (KeyError, ValueError):
-            pass
-
-        if self.current_hotkey not in MODIFIERS:
-            keyboard.add_hotkey(self.current_hotkey, self.switch_layout, suppress=True)
 
     def change_hotkey_runtime(self):
         self.reset_buffer()
@@ -377,14 +475,11 @@ class Flip8App:
                 self.save_config(self.current_hotkey)
                 self.modifier_down_time = 0
                 self.combo_pressed = False
-                self.register_hotkey()
 
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showinfo("Flip8", "Налаштування успішно збережено!")
-            root.destroy()
+            # Вікно повідомлення також викликаємо безпечно
+            messagebox.showinfo("Flip8", "Налаштування успішно збережено!", parent=self.root)
 
 
 if __name__ == "__main__":
     app = Flip8App()
-    keyboard.wait()
+    app.run()  # Тепер app.run() запускає безпечний цикл Tkinter
