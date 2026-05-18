@@ -15,14 +15,14 @@ import queue
 CONFIG_FILE = "config.json"
 APP_NAME = "F8Flip"
 
-# СПИСОК ВИНЯТКІВ: Додай сюди назви .exe файлів, де програма має "спати"
+# СПИСОК ВИНЯТКІВ: сюди назви .exe файлів, де програма має "спати"
 IGNORE_APPS = {
     "blender.exe",
     "3dsmax.exe",
     "photoshop.exe",
     "zbrush.exe",
     "maya.exe",
-    "acs.exe"  # Assetto Corsa
+    "acs.exe" 
 }
 
 ENG_SET = set("qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM[]{}'\"`~<>;:")
