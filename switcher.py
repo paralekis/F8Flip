@@ -246,6 +246,24 @@ def set_system_layout(hkl_code):
         user32.PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, hkl_code)
 
 
+# --- ЗАХИСТ ВІД ПОДВІЙНОГО ЗАПУСКУ ---
+ERROR_ALREADY_EXISTS = 183
+MUTEX_NAME = "Global\\F8Flip_SingleInstance_Mutex_v1"
+
+
+def prevent_multiple_instances():
+    # Створюємо унікальний системний маркер
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    last_error = ctypes.windll.kernel32.GetLastError()
+
+    if last_error == ERROR_ALREADY_EXISTS:
+        # Якщо маркер вже існує, значить програма вже запущена
+        sys.exit(0)
+
+    # Важливо повернути mutex, щоб збирач сміття Python не видалив його
+    # до завершення роботи програми
+    return mutex
+
 # --- ОСНОВНИЙ КЛАС ДОДАТКУ ---
 class Flip8App:
     def __init__(self):
@@ -655,5 +673,9 @@ class Flip8App:
 
 
 if __name__ == "__main__":
+    # Спочатку перевіряємо, чи немає вже запущеної копії
+    app_mutex = prevent_multiple_instances()
+
+    # Якщо ми дійшли сюди, значить це перший запуск
     app = Flip8App()
     app.run()
